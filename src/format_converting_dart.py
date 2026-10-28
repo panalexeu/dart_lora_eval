@@ -1,3 +1,4 @@
+# ref adjusted to template fomat I used for training: https://github.com/panalexeu/nano_lora/blob/main/data/dart/prepare.py
 #  ------------------------------------------------------------------------------------------
 #  Copyright (c) Microsoft Corporation. All rights reserved.
 #  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
@@ -6,6 +7,7 @@ import sys
 import io
 import json
 
+TEMPLATE = "### Triples:\n{triples}\n\n### Text:\n"
 
 with open(sys.argv[1], 'r', encoding='utf8') as reader, \
      open(sys.argv[2], 'w', encoding='utf8') as writer :
@@ -21,11 +23,11 @@ with open(sys.argv[1], 'r', encoding='utf8') as reader, \
         temp_triples = ''
         for i, tripleset in enumerate(example['tripleset']):
             subj, rela, obj = tripleset
-            rela = rela.lower()
             rela_lst.append(rela)
             if i > 0:
-                temp_triples += ' | '
-            temp_triples += '{} : {} : {}'.format(subj, rela, obj)
+                temp_triples += '\n'
+            temp_triples += '{} | {} | {}'.format(subj, rela, obj)
+        temp_triples = TEMPLATE.format(triples=temp_triples)
 
         unique_src += 1
 
