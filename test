@@ -1,7 +1,7 @@
 python ./src/format_converting_dart.py ./data/dart/dart-v1.1.1-full-test.json ./dart.jsonl
 
 torchrun --nproc_per_node=1 src/gpt2_beam.py \
-    --data ./data/dart/test.jsonl \
+    --data ./data/dart/test_enc.jsonl \
     --batch_size 8 \
     --seq_len 256 \
     --eval_len 64 \
@@ -10,7 +10,7 @@ torchrun --nproc_per_node=1 src/gpt2_beam.py \
     --length_penalty 0.8 \
     --no_repeat_ngram_size 4 \
     --repetition_penalty 1.0 \
-    --eos_token_id 628 \
+    --eos_token_id 50256 \
     --work_dir . \
     --output_file dart_predict.jsonl \
     --platform local

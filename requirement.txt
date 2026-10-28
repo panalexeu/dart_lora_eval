@@ -18,3 +18,4 @@ nvidia-nvjitlink==13.4.92
 nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 progress
+regex==2026.9.29

@@ -79,8 +79,41 @@ def print_args(args):
         print('=' * 100)
 
 
-def _reorder_cache(past: Tuple, beam_idx: Tensor) -> Tuple[Tensor]:
-    return tuple(layer_past.index_select(1, beam_idx).contiguous().detach() for layer_past in past)
+def _forward_cached(model, idx: Tensor, caches: List, pos: Optional[Tensor] = None) -> Tensor:
+    """ pos=None: prefill idx (B, T) from position 0; else idx (B, 1) holds new tokens at positions pos (B,) """
+    if pos is None:
+        pos_emb = model.transformer.wpe(torch.arange(idx.size(1), device=idx.device))
+    else:
+        pos_emb = model.transformer.wpe(pos).unsqueeze(1)
+    x = model.transformer.wte(idx) + pos_emb
+    for block, cache in zip(model.transformer.h, caches):
+        x = block(x, cache=cache, pos=pos)
+    return model.transformer.ln_f(x)
+
+
+def _new_cache(model, rows: int, t_max: int, device) -> List:
+    nh, hs = model.config.n_head, model.config.n_embd // model.config.n_head
+    return [
+        tuple(torch.empty(rows, nh, t_max, hs, device=device, dtype=torch.bfloat16) for _ in range(2))
+        for _ in model.transformer.h
+    ]
+
+
+def _reorder_cache(caches: List, beam_idx: Tensor, t: int) -> None:
+    # layer by layer, so the temporary copy is one layer, not the whole cache; only slots < t are filled
+    for k_buf, v_buf in caches:
+        k_buf[:, :, :t] = k_buf[beam_idx, :, :t]
+        v_buf[:, :, :t] = v_buf[beam_idx, :, :t]
+
+
+def _prefill(model, query: Tensor, caches: List, num_beams: int) -> Tensor:
+    """ prefill each example once into its beam-0 rows, then copy beam 0 to the other beams in place """
+    t = query.size(1)
+    h = _forward_cached(model, query, [(k[::num_beams], v[::num_beams]) for k, v in caches])
+    for buf in itertools.chain.from_iterable(caches):
+        b = buf.view(-1, num_beams, *buf.shape[1:]) # batch_size, beam, nh, T_max, hs
+        b[:, 1:, :, :t] = b[:, :1, :, :t]
+    return h
 
 
 def _calc_banned_ngram_tokens(
@@ -199,8 +232,11 @@ def beam(model, data_iter, args):
     start_time = time.time()
 
     all_predictions = {}
+    # allocated once for the worst case and reused by every batch: no per-batch allocs, no fragmentation
+    full_cache = _new_cache(model, args.batch_size * args.beam, args.seq_len, args.device)
     with torch.no_grad():
         for idx, data in enumerate(data_iter):
+            t0 = time.time()
             data = {key: value for key, value in data.items()}
 
             _id = data['id'].to(args.device)
@@ -220,14 +256,16 @@ def beam(model, data_iter, args):
             length_penalty = args.length_penalty
 
             _batch = torch.arange(0, _id.size(0), device=args.device, dtype=torch.long)
-            
-            past = None
-            len_past = None
 
-            _query = _query.repeat(1, num_beams).view(batch_size * num_beams, -1)
+            # prefill once per example, then copy the cache to every beam
+            q_max = int(_query_len.max().item())
+            caches = [(k[:batch_size * num_beams], v[:batch_size * num_beams]) for k, v in full_cache]
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                h = _prefill(model, _query[:, :q_max], caches, num_beams)
+                logits = model.lm_head(h[_batch, _query_len - 1]).float().repeat_interleave(num_beams, 0)
+
             _query_len = _query_len.unsqueeze(-1).repeat(1, num_beams).view(-1)
 
-            _bbatch = _batch.unsqueeze(-1).repeat(1, num_beams).view(-1)
             
             # scores for each sentence in the beam
             beam_scores = torch.zeros(
@@ -240,18 +278,12 @@ def beam(model, data_iter, args):
             best_score = {}
 
             history = None
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 for i in range(0, args.eval_len):
-                    if i == 0:
-                        logits, past = model(_query) 
-                        logits = logits[_bbatch, (_query_len-1).long(), :] # batch_size * beam, vocab
-                    else:
-                        #print('token_id.shape', token_id.shape, token_id)
-                        #print('past.shape', past[0].shape)
-                        #print('len_past.shape', len_past.shape, len_past)
-                        
-                        logits, past = model(token_id, past=past, len_past=len_past) 
-                        logits = logits[:, -1, :]    # batch_size * beam, vocab
+                    if i > 0:
+                        # token picked at step i-1 sits at position _query_len + i - 1
+                        h = _forward_cached(model, token_id, caches, pos=(_query_len + i - 1).long())
+                        logits = model.lm_head(h[:, -1]).float() # batch_size * beam, vocab
 
                     logits = _postprocess_next_token_scores(           
                         logits,
@@ -287,9 +319,8 @@ def beam(model, data_iter, args):
                     token_id = (next_tokens % vocab_size).view(-1).unsqueeze(-1) # batch_size, num_beams
 
                     beam_idx = beam_id.view(batch_size, num_beams) + (_batch * num_beams).unsqueeze(-1)
-                    past = _reorder_cache(past, beam_idx.view(-1))                
+                    _reorder_cache(caches, beam_idx.view(-1), q_max + i)
                     beam_scores = next_scores # batch_size, num_beams
-                    len_past = (_query_len + i).long()
 
                     if history is None:
                         history = token_id.detach()
@@ -300,6 +331,14 @@ def beam(model, data_iter, args):
                         best_score, best_sequence, batch_size, num_beams, beam_scores, history, 
                         eos_token_id=args.eos_token_id
                     )
+
+                    # exact early stop: log-probs are <= 0, so an alive beam with score s can end at most at
+                    # s / L ** length_penalty for some future length L in [i + 1, eval_len]
+                    if len(best_score) == batch_size:
+                        denom = max((i + 1) ** length_penalty, args.eval_len ** length_penalty)
+                        best = torch.stack([best_score[b] for b in range(batch_size)])
+                        if bool((best >= beam_scores.max(dim=1).values / denom).all()):
+                            break
                 
                 _add_beam_candidate(
                     best_score, best_sequence, batch_size, num_beams, beam_scores, history
@@ -324,8 +363,7 @@ def beam(model, data_iter, args):
                     all_predictions[_i]['predict'] = output[_b].tolist()
                     #all_predictions[_i]['score'] = score[_b].tolist()
 
-                if idx % 10 == 0:
-                    print('inference samples', idx)
+                print(f'batch {idx} {time.time() - t0:.2f}s steps {i + 1}')
 
     if args.rank == 0:
         pred_file = os.path.join(args.work_dir, args.output_file) 
@@ -334,7 +372,7 @@ def beam(model, data_iter, args):
             for _i in all_predictions:
                 writer.write(json.dumps(all_predictions[_i]) + '\n')
 
-def _load_model(ckpt: dict) -> nn.Module: 
+def _load_model(ckpt: dict, device) -> nn.Module:
     gptconf = GPTConfig(**ckpt['model_args'])
     model = GPT(gptconf)
     state_dict = ckpt['model']
@@ -343,7 +381,7 @@ def _load_model(ckpt: dict) -> nn.Module:
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    return model
+    return model.to(device, dtype=torch.bfloat16)
 
 
 if __name__ == '__main__':
@@ -357,15 +395,21 @@ if __name__ == '__main__':
     valid_data = FT_Dataset(
         args.data, args.batch_size, args.seq_len, args.eval_len, 
     )    
+    # one line per reference, but gpt2_decode keeps one prediction per context: decode each context once
+    first_idx = {}
+    for i, (context, _) in enumerate(valid_data.ft_samples):
+        first_idx.setdefault(tuple(context), i)
+    print(f'unique contexts {len(first_idx)} of {valid_data.num_examples}')
+    valid_data = torch.utils.data.Subset(valid_data, list(first_idx.values()))
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_data)
     valid_loader = DataLoader(
         valid_data, batch_size=args.batch_size, num_workers=0, shuffle=False, 
         pin_memory=False, drop_last=False, sampler=valid_sampler
     )
 
-    ckpt = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
-    model = _load_model(ckpt)
-    breakpoint()
+    ckpt = torch.load(args.init_checkpoint, map_location='cpu', weights_only=False)
+    model = _load_model(ckpt, args.device)
+    del ckpt
 
     print('model sampling ...')
     beam(model, valid_loader, args)

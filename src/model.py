@@ -51,7 +51,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, xq=None, xk=None, xv=None):
+    def forward(self, x, xq=None, xk=None, xv=None, cache=None, pos=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -63,8 +63,24 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        # kv cache: preallocated (k_buf, v_buf) of shape (B, nh, T_max, hs)
+        if cache is not None and pos is None:
+            # prefill: x holds positions 0..T-1, plain causal attention
+            k_buf, v_buf = cache
+            k_buf[:, :, :T] = k
+            v_buf[:, :, :T] = v
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif cache is not None:
+            # decode: x is one new token per row (T == 1) at per-row position pos (B,)
+            k_buf, v_buf = cache
+            rows = torch.arange(B, device=x.device)
+            k_buf[rows, :, pos] = k[:, :, 0]
+            v_buf[rows, :, pos] = v[:, :, 0]
+            L = int(pos.max().item()) + 1
+            # rows are right-padded to different lengths: attend only to slots <= own pos
+            mask = (torch.arange(L, device=x.device) <= pos[:, None]).view(B, 1, 1, L)
+            y = F.scaled_dot_product_attention(q, k_buf[:, :, :L], v_buf[:, :, :L], attn_mask=mask)
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -105,8 +121,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cache=None, pos=None):
+        x = x + self.attn(self.ln_1(x), cache=cache, pos=pos)
         x = x + self.mlp(self.ln_2(x))
         return x
 
