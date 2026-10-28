@@ -50,7 +50,6 @@ import re
 
 from bert_score import score
 from metrics.chrF import computeChrF
-from metrics.bleurt.bleurt import score as bleurt_score
 
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from razdel import tokenize
@@ -68,7 +67,8 @@ def parse(refs_path, hyps_path, num_refs, lng='en'):
     for i in range(num_refs):
         fname = refs_path + str(i) if num_refs > 1 else refs_path
         with codecs.open(fname, 'r', 'utf-8') as f:
-            texts = f.read().split('\n')
+            texts = f.read()
+            texts = (texts[:-1] if texts.endswith('\n') else texts).split('\n') # drop the trailing newline only
             for j, text in enumerate(texts):
                 if len(references) <= j:
                     references.append([text])
@@ -85,7 +85,8 @@ def parse(refs_path, hyps_path, num_refs, lng='en'):
 
     # hypothesis
     with codecs.open(hyps_path, 'r', 'utf-8') as f:
-        hypothesis = f.read().split('\n')
+        hypothesis = f.read()
+        hypothesis = (hypothesis[:-1] if hypothesis.endswith('\n') else hypothesis).split('\n') # drop the trailing newline only
 
     # hypothesis tokenized
     hypothesis_tok = copy.copy(hypothesis)
@@ -255,6 +256,8 @@ def bert_score_(references, hypothesis, lng='en'):
     return P, R, F1
 
 def bleurt(references, hypothesis, num_refs, checkpoint = "metrics/bleurt/bleurt-base-128"):
+    # imported lazily: needs the bleurt package + tensorflow, only when the bleurt metric is requested
+    from metrics.bleurt.bleurt import score as bleurt_score
     refs, cands = [], []
     for i, hyp in enumerate(hypothesis):
         for ref in references[i][:num_refs]:

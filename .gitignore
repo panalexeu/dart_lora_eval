@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 *.pt 
+# cloned by eval/download_evalscript.sh
+eval/GenerationEval/
+eval/e2e/
