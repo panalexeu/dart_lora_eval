@@ -113,34 +113,6 @@ python src/gpt2_decode.py \
 python eval/e2e/measure_scores.py e2e_ref.txt e2e_pred.txt -p
 ```
 
-## Replicating Our Result on WebNLG
-
-1. Follow steps 1 and 2 from E2E pipeline by replacing references to E2E with webnlg (see our paper for hyperparameters)
-
-2. Decode outputs from beam search (step 2 above)
-```
-python src/gpt2_decode.py \
-    --vocab ./vocab \
-    --sample_file ./trained_models/GPT2_M/webnlg/predict.20000.b10p08.jsonl \
-    --input_file ./data/webnlg_challenge_2017/test_formatted.jsonl \
-    --ref_type webnlg \
-    --ref_num 6 \
-    --output_ref_file eval/GenerationEval/data/references_webnlg \
-    --output_pred_file eval/GenerationEval/data/hypothesis_webnlg \
-    --tokenize --lower
-```
-
-3. Run evaluation on WebNLG test set
-```
-cd ./eval/GenerationEval/
-python eval.py \
-    -R data/references_webnlg/reference \
-    -H data/hypothesis_webnlg \
-    -nr 6 \
-    -m bleu,meteor,ter 
-cd ../..
-```
-
 ## Replicating Our Result on DART
 
 1. Follow steps 1 and 2 from E2E pipeline by replacing references to E2E with dart (see our paper for hyperparameters)

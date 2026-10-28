@@ -18,8 +18,6 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 torch.set_printoptions(threshold=100000)
 
-import numpy as np
-
 from gpu import (
     add_gpu_params, 
     parse_gpu, 
@@ -32,7 +30,7 @@ from gpu import (
 from exp_utils import create_exp_dir
 
 from data_utils import FT_Dataset 
-from model import GPT2Config, GPT2LMModel
+from model import GPT, GPTConfig
 
 
 parser = argparse.ArgumentParser(description='PyTorch GPT2 beam decoding')
@@ -54,14 +52,7 @@ parser.add_argument('--eval_len', type=int, default=256,
 parser.add_argument('--min_length', type=int, default=0,
                     help='minimum generation length')
 
-parser.add_argument('--model_card', default='gpt2.sm', choices=['gpt2.sm', 'gpt2.md', 'gpt2.lg'],
-                    help='model names')
-
 parser.add_argument('--init_checkpoint', default=None, type=str, help='initial checkpoint')
-
-parser.add_argument('--lora_dim', type=int, default=0, help='lora attn dimension')
-
-parser.add_argument('--lora_alpha', type=int, default=128, help='lora attn alpha')
 
 parser.add_argument('--work_dir', type=str, default=os.getenv('PT_OUTPUT_DIR', 'gpt2_model'), 
                     help='working folder')
@@ -79,7 +70,6 @@ parser.add_argument('--eos_token_id', action='append', type=int, default=[50256]
 
 parser.add_argument('--output_file', type=str, default='beam_prediction.jsonl', 
                     help='output file name')
-
 
 def print_args(args):
     if args.rank == 0:
@@ -343,7 +333,18 @@ def beam(model, data_iter, args):
         with open(pred_file, 'w') as writer:
             for _i in all_predictions:
                 writer.write(json.dumps(all_predictions[_i]) + '\n')
-    
+
+def _load_model(ckpt: dict) -> nn.Module: 
+    gptconf = GPTConfig(**ckpt['model_args'])
+    model = GPT(gptconf)
+    state_dict = ckpt['model']
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    return model
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -362,31 +363,12 @@ if __name__ == '__main__':
         pin_memory=False, drop_last=False, sampler=valid_sampler
     )
 
-    if args.model_card == 'gpt2.sm':
-        config = GPT2Config(
-            n_embd=768, n_layer=12, n_head=12, 
-            lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-        )
-    elif args.model_card == 'gpt2.md':
-        config = GPT2Config(
-            n_embd=1024, n_layer=24, n_head=16, 
-            lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-        )
-    elif args.model_card == 'gpt2.lg':
-        config = GPT2Config(
-            n_embd=1280, n_layer=36, n_head=20, 
-            lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-        )
-
-    lm_net = GPT2LMModel(config)
-    if args.init_checkpoint is not None:
-        print('loading model pretrained weight.')
-        cp = torch.load(args.init_checkpoint, map_location=torch.device('cpu'))
-        lm_net.load_weight(cp)    
-    lm_net = lm_net.cuda()
+    ckpt = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
+    model = _load_model(ckpt)
+    breakpoint()
 
     print('model sampling ...')
-    beam(lm_net, valid_loader, args)
+    beam(model, valid_loader, args)
     distributed_sync(args)
     print('cleanup dist ...')
     cleanup(args)

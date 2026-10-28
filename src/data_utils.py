@@ -6,7 +6,6 @@ import os, sys
 import glob
 import random
 from collections import Counter, OrderedDict
-import numpy as np
 import torch
 import json
 
